@@ -1081,7 +1081,9 @@ fn fn_sig_excluded(sig: &syn::Signature) -> bool {
 
 /// True if any of the attrs indicate that we should skip this node and everything inside it.
 ///
-/// This checks for `#[cfg(test)]`, attributes whose path ends with `test` (like `#[test]` or `#[tokio::test]`), and `#[mutants::skip]`.
+/// This checks for `cfg` attributes that require `test` (like `#[cfg(test)]` or
+/// `#[cfg(all(test, feature = "x"))]`), attributes whose path ends with `test` (like `#[test]`
+/// or `#[tokio::test]`), and `#[mutants::skip]`.
 fn attrs_excluded(attrs: &[Attribute]) -> bool {
     attrs
         .iter()
@@ -1093,27 +1095,46 @@ fn block_is_empty(block: &syn::Block) -> bool {
     block.stmts.is_empty()
 }
 
-/// True if the attribute looks like `#[cfg(test)]`, or has "test"
-/// anywhere in it.
+/// True if the attribute is a `cfg` whose predicate can only hold when `test` is set.
+///
+/// This matches `#[cfg(test)]` and also, for example, `#[cfg(all(test, feature = "x"))]`.
+/// Code under `#[cfg(any(test, feature = "x"))]` or `#[cfg(not(test))]` can be compiled
+/// without `test`, so it is not matched.
 fn attr_is_cfg_test(attr: &Attribute) -> bool {
     if !path_is(attr.path(), &["cfg"]) {
         return false;
     }
-    let mut contains_test = false;
-    if let Err(err) = attr.parse_nested_meta(|meta| {
-        if meta.path.is_ident("test") {
-            contains_test = true;
+    match attr.parse_args::<syn::Meta>() {
+        Ok(predicate) => cfg_requires_test(&predicate),
+        Err(err) => {
+            trace!(
+                ?err,
+                attr = attr.to_pretty_string(),
+                "Attribute is in an unrecognized form so skipped",
+            );
+            false
         }
-        Ok(())
-    }) {
-        trace!(
-            ?err,
-            attr = attr.to_pretty_string(),
-            "Attribute is in an unrecognized form so skipped",
-        );
-        return false;
     }
-    contains_test
+}
+
+/// True if a `cfg` predicate can only be true when `test` is set.
+fn cfg_requires_test(predicate: &syn::Meta) -> bool {
+    let syn::Meta::List(list) = predicate else {
+        return predicate.path().is_ident("test");
+    };
+    let Ok(args) = list.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+    ) else {
+        return false;
+    };
+    if list.path.is_ident("all") {
+        args.iter().any(cfg_requires_test)
+    } else if list.path.is_ident("any") {
+        // `any()` is never true, so its code is never compiled.
+        args.iter().all(cfg_requires_test)
+    } else {
+        false
+    }
 }
 
 /// True if the attribute path ends with `test`.
@@ -1376,6 +1397,44 @@ mod test {
             .discover(&PackageFilter::All, &options, &console)
             .unwrap();
         assert_eq!(discovered.mutants.as_slice(), &[]);
+    }
+
+    #[test]
+    fn attr_is_cfg_test_matches_predicates_that_require_test() {
+        let cases = [
+            (quote! { #[cfg(test)] }, true),
+            (quote! { #[cfg(all(test, feature = "x"))] }, true),
+            (quote! { #[cfg(all(feature = "x", test))] }, true),
+            (
+                quote! { #[cfg(any(all(test, unix), all(test, windows)))] },
+                true,
+            ),
+            (quote! { #[cfg(any(test, feature = "x"))] }, false),
+            (quote! { #[cfg(not(test))] }, false),
+            (quote! { #[cfg(feature = "x")] }, false),
+            (quote! { #[cfg_attr(test, derive(Debug))] }, false),
+        ];
+        for (tokens, expected) in cases {
+            let attrs = syn::parse::Parser::parse2(Attribute::parse_outer, tokens.clone()).unwrap();
+            assert_eq!(attr_is_cfg_test(&attrs[0]), expected, "{tokens}");
+        }
+    }
+
+    #[test]
+    fn functions_under_cfg_all_test_are_not_mutated() {
+        let mutants = mutate_source_str(
+            indoc! {r#"
+                #[cfg(all(test, feature = "x"))]
+                mod helpers {
+                    pub fn one() -> u32 {
+                        1
+                    }
+                }
+            "#},
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(mutants, []);
     }
 
     /// Helper function for `find_path_attribute` tests
