@@ -10,7 +10,7 @@ Mutants each have a "genre", each of which is described below.
 
 Some functions are automatically excluded from mutation:
 
-- Functions marked with `#[cfg(test)]` or in files marked with `#![cfg(test)]`
+- Functions marked with `#[cfg(test)]` or in files marked with `#![cfg(test)]`, and more generally code under any `cfg` predicate that can only hold in test builds, such as `#[cfg(all(test, feature = "x"))]`. Code under `#[cfg(any(test, feature = "x"))]` can be built outside tests, so it is still mutated.
 - Test functions: functions with attributes whose path ends with `test`, including `#[test]`, `#[tokio::test]`, `#[sqlx::test]`, and similar testing framework attributes
 - Functions marked with `#[mutants::skip]`
 - `unsafe` functions

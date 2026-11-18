@@ -10,14 +10,14 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::needless_raw_string_hashes)]
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::vec;
 
 use anyhow::anyhow;
 use camino::{Utf8Path, Utf8PathBuf};
-use proc_macro2::{Ident, TokenStream};
-use quote::{ToTokens, quote};
+use proc_macro2::{Ident, TokenStream, TokenTree};
+use quote::{ToTokens, quote, quote_spanned};
 use regex::RegexSet;
 use syn::ext::IdentExt;
 use syn::spanned::Spanned;
@@ -93,6 +93,9 @@ fn walk_package(
     let mut files = Vec::new();
     let mut filename_queue =
         VecDeque::from_iter(package.top_sources.iter().map(|p| (p.to_owned(), true)));
+    // The same file can be named by more than one `mod` statement, for example in
+    // alternative `cfg_if!` branches, but it should only be visited once.
+    let mut queued: HashSet<Utf8PathBuf> = package.top_sources.iter().cloned().collect();
     while let Some((path, package_top)) = filename_queue.pop_front() {
         let Some(source_file) = SourceFile::load(workspace_dir, &path, package, package_top)?
         else {
@@ -114,7 +117,9 @@ fn walk_package(
         // collect any mutants from them, and they don't count as "seen" for
         // `--list-files`.
         for mod_namespace in &external_mods {
-            if let Some(mod_path) = find_mod_source(workspace_dir, &source_file, mod_namespace) {
+            if let Some(mod_path) = find_mod_source(workspace_dir, &source_file, mod_namespace)
+                && queued.insert(mod_path.clone())
+            {
                 filename_queue.push_back((mod_path, false));
             }
         }
@@ -778,6 +783,29 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         });
     }
 
+    /// Visit an item-position macro invocation, such as `cfg_if! { ... }`.
+    ///
+    /// The macro body is not mutated, but `mod foo;` statements inside it are
+    /// followed, so that files declared through a macro are still discovered.
+    fn visit_item_macro(&mut self, i: &'ast syn::ItemMacro) {
+        if i.ident.is_some() {
+            // `macro_rules! name { ... }` defines a macro: its body is a template,
+            // not items in this module.
+            return;
+        }
+        let _span = trace_span!("item_macro", line = i.span().start().line).entered();
+        if attrs_excluded(&i.attrs) {
+            trace!("macro excluded by attrs");
+            return;
+        }
+        let external_mods = external_mods_in_macro(&i.mac.tokens);
+        self.in_exclude_re_scope(&i.attrs, |v| {
+            for item_mod in &external_mods {
+                v.visit_item_mod(item_mod);
+            }
+        });
+    }
+
     /// Visit `a op b` expressions.
     fn visit_expr_binary(&mut self, i: &'ast syn::ExprBinary) {
         let _span = trace_span!("binary", line = i.op.span().start().line).entered();
@@ -1081,7 +1109,9 @@ fn fn_sig_excluded(sig: &syn::Signature) -> bool {
 
 /// True if any of the attrs indicate that we should skip this node and everything inside it.
 ///
-/// This checks for `#[cfg(test)]`, attributes whose path ends with `test` (like `#[test]` or `#[tokio::test]`), and `#[mutants::skip]`.
+/// This checks for `cfg` attributes that require `test` (like `#[cfg(test)]` or
+/// `#[cfg(all(test, feature = "x"))]`), attributes whose path ends with `test` (like `#[test]`
+/// or `#[tokio::test]`), and `#[mutants::skip]`.
 fn attrs_excluded(attrs: &[Attribute]) -> bool {
     attrs
         .iter()
@@ -1093,27 +1123,129 @@ fn block_is_empty(block: &syn::Block) -> bool {
     block.stmts.is_empty()
 }
 
-/// True if the attribute looks like `#[cfg(test)]`, or has "test"
-/// anywhere in it.
+/// True if the attribute is a `cfg` whose predicate can only hold when `test` is set.
+///
+/// This matches `#[cfg(test)]` and also, for example, `#[cfg(all(test, feature = "x"))]`.
+/// Code under `#[cfg(any(test, feature = "x"))]` or `#[cfg(not(test))]` can be compiled
+/// without `test`, so it is not matched.
 fn attr_is_cfg_test(attr: &Attribute) -> bool {
     if !path_is(attr.path(), &["cfg"]) {
         return false;
     }
-    let mut contains_test = false;
-    if let Err(err) = attr.parse_nested_meta(|meta| {
-        if meta.path.is_ident("test") {
-            contains_test = true;
+    match attr.parse_args::<syn::Meta>() {
+        Ok(predicate) => cfg_requires_test(&predicate),
+        Err(err) => {
+            trace!(
+                ?err,
+                attr = attr.to_pretty_string(),
+                "Attribute is in an unrecognized form so skipped",
+            );
+            false
         }
-        Ok(())
-    }) {
-        trace!(
-            ?err,
-            attr = attr.to_pretty_string(),
-            "Attribute is in an unrecognized form so skipped",
-        );
-        return false;
     }
-    contains_test
+}
+
+/// True if a `cfg` predicate can only be true when `test` is set.
+fn cfg_requires_test(predicate: &syn::Meta) -> bool {
+    let syn::Meta::List(list) = predicate else {
+        return predicate.path().is_ident("test");
+    };
+    let Ok(args) = list.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+    ) else {
+        return false;
+    };
+    if list.path.is_ident("all") {
+        args.iter().any(cfg_requires_test)
+    } else if list.path.is_ident("any") {
+        // `any()` is never true, so its code is never compiled.
+        args.iter().all(cfg_requires_test)
+    } else {
+        false
+    }
+}
+
+/// Find the `mod foo;` statements in the tokens of an item-position macro invocation.
+///
+/// A macro body is not necessarily made of items, so this is a heuristic. It finds
+/// items in braced bodies, as in `cfg_if! { if #[cfg(x)] { mod a; } }` or
+/// `scope!(LEVEL { mod a; })`, and in comma-separated arguments, as in
+/// `declare!(LEVEL, pub mod a)`, where a missing trailing semicolon is accepted.
+///
+/// Inline modules (`mod a { ... }`) are not returned, since their bodies are not
+/// visited.
+fn external_mods_in_macro(tokens: &TokenStream) -> Vec<syn::ItemMod> {
+    let mut found = Vec::new();
+    collect_external_mods(tokens, &mut found);
+    found
+}
+
+fn collect_external_mods(tokens: &TokenStream, found: &mut Vec<syn::ItemMod>) {
+    let parse_items = |input: syn::parse::ParseStream| {
+        let mut items = Vec::new();
+        while !input.is_empty() {
+            items.push(input.parse::<syn::Item>()?);
+        }
+        Ok(items)
+    };
+    if let Ok(items) = syn::parse::Parser::parse2(parse_items, tokens.clone()) {
+        for item in items {
+            collect_external_mods_from_item(item, found);
+        }
+        return;
+    }
+    for segment in split_top_level_commas(tokens) {
+        if let Some(item) = parse_item_allowing_missing_semicolon(&segment) {
+            collect_external_mods_from_item(item, found);
+        } else {
+            for tree in segment {
+                if let TokenTree::Group(group) = tree {
+                    collect_external_mods(&group.stream(), found);
+                }
+            }
+        }
+    }
+}
+
+fn collect_external_mods_from_item(item: syn::Item, found: &mut Vec<syn::ItemMod>) {
+    match item {
+        syn::Item::Mod(item_mod) if item_mod.content.is_none() => found.push(item_mod),
+        syn::Item::Macro(item_macro)
+            if item_macro.ident.is_none() && !attrs_excluded(&item_macro.attrs) =>
+        {
+            collect_external_mods(&item_macro.mac.tokens, found);
+        }
+        _ => {}
+    }
+}
+
+/// Split a token stream on commas that are not inside a group.
+fn split_top_level_commas(tokens: &TokenStream) -> Vec<TokenStream> {
+    let mut segments = vec![TokenStream::new()];
+    for tree in tokens.clone() {
+        match &tree {
+            TokenTree::Punct(punct) if punct.as_char() == ',' => {
+                segments.push(TokenStream::new());
+            }
+            _ => segments
+                .last_mut()
+                .expect("segments is never empty")
+                .extend([tree]),
+        }
+    }
+    segments.retain(|segment| !segment.is_empty());
+    segments
+}
+
+/// Parse tokens as one item, also accepting `pub mod foo` without its semicolon.
+fn parse_item_allowing_missing_semicolon(tokens: &TokenStream) -> Option<syn::Item> {
+    if let Ok(item) = syn::parse2::<syn::Item>(tokens.clone()) {
+        return Some(item);
+    }
+    let span = tokens.clone().into_iter().last()?.span();
+    let mut terminated = tokens.clone();
+    terminated.extend(quote_spanned!(span=> ;));
+    syn::parse2::<syn::Item>(terminated).ok()
 }
 
 /// True if the attribute path ends with `test`.
@@ -1376,6 +1508,160 @@ mod test {
             .discover(&PackageFilter::All, &options, &console)
             .unwrap();
         assert_eq!(discovered.mutants.as_slice(), &[]);
+    }
+
+    /// Walk `code` as `src/lib.rs` and return the external modules it names, as `a::b` paths.
+    fn external_mod_names(code: &str) -> Vec<String> {
+        let options = Options::default();
+        let source_file =
+            SourceFile::for_tests("src/lib.rs", code, "cargo-mutants-testdata-internal", true);
+        let error_exprs = options.parsed_error_exprs().unwrap();
+        let (_, external_mods) = walk_file(&source_file, &error_exprs, &options).unwrap();
+        external_mods
+            .iter()
+            .map(|m| m.parts.iter().map(|part| part.name.as_str()).join("::"))
+            .collect()
+    }
+
+    #[test]
+    fn mod_statements_inside_item_macros_are_followed() {
+        let names = external_mod_names(indoc! {r#"
+            mod plain;
+            cfg_if::cfg_if! {
+                if #[cfg(unix)] {
+                    mod unix_impl;
+                } else {
+                    mod other_impl;
+                }
+            }
+            scope!(BETA {
+                pub mod braced;
+                pub(crate) use braced::Thing;
+            });
+            scope!(ALPHA, cfg(feature = "std") {
+                mod gated;
+            });
+            declare!(BETA, pub mod argument);
+        "#});
+        assert_eq!(
+            names,
+            [
+                "plain",
+                "unix_impl",
+                "other_impl",
+                "braced",
+                "gated",
+                "argument"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_only_mods_inside_item_macros_are_not_followed() {
+        let names = external_mod_names(indoc! {r#"
+            scope!(BETA {
+                mod real;
+                #[cfg(test)]
+                mod tests;
+                #[cfg(all(test, feature = "arbitrary"))]
+                mod conformance;
+            });
+            #[cfg(test)]
+            scope!(BETA {
+                mod test_support;
+            });
+        "#});
+        assert_eq!(names, ["real"]);
+    }
+
+    #[test]
+    fn macro_rules_bodies_are_not_searched_for_mods() {
+        let names = external_mod_names(indoc! {"
+            macro_rules! declare {
+                ($name:ident) => {
+                    mod $name;
+                    mod fixed;
+                };
+            }
+        "});
+        assert_eq!(names, Vec::<String>::new());
+    }
+
+    #[test]
+    fn mod_inside_item_macro_keeps_path_attribute() {
+        let options = Options::default();
+        let source_file = SourceFile::for_tests(
+            "src/lib.rs",
+            indoc! {r#"
+                scope!(BETA {
+                    #[path = "other_file.rs"]
+                    mod renamed;
+                });
+            "#},
+            "cargo-mutants-testdata-internal",
+            true,
+        );
+        let error_exprs = options.parsed_error_exprs().unwrap();
+        let (_, external_mods) = walk_file(&source_file, &error_exprs, &options).unwrap();
+        assert_eq!(external_mods.len(), 1);
+        assert_eq!(
+            external_mods[0].parts[0].path_attribute,
+            Some(Utf8PathBuf::from("other_file.rs"))
+        );
+    }
+
+    #[test]
+    fn item_macro_bodies_are_not_mutated() {
+        let mutants = mutate_source_str(
+            indoc! {"
+                scope!(BETA {
+                    pub fn answer() -> u32 {
+                        40 + 2
+                    }
+                });
+            "},
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(mutants, []);
+    }
+
+    #[test]
+    fn attr_is_cfg_test_matches_predicates_that_require_test() {
+        let cases = [
+            (quote! { #[cfg(test)] }, true),
+            (quote! { #[cfg(all(test, feature = "x"))] }, true),
+            (quote! { #[cfg(all(feature = "x", test))] }, true),
+            (
+                quote! { #[cfg(any(all(test, unix), all(test, windows)))] },
+                true,
+            ),
+            (quote! { #[cfg(any(test, feature = "x"))] }, false),
+            (quote! { #[cfg(not(test))] }, false),
+            (quote! { #[cfg(feature = "x")] }, false),
+            (quote! { #[cfg_attr(test, derive(Debug))] }, false),
+        ];
+        for (tokens, expected) in cases {
+            let attrs = syn::parse::Parser::parse2(Attribute::parse_outer, tokens.clone()).unwrap();
+            assert_eq!(attr_is_cfg_test(&attrs[0]), expected, "{tokens}");
+        }
+    }
+
+    #[test]
+    fn functions_under_cfg_all_test_are_not_mutated() {
+        let mutants = mutate_source_str(
+            indoc! {r#"
+                #[cfg(all(test, feature = "x"))]
+                mod helpers {
+                    pub fn one() -> u32 {
+                        1
+                    }
+                }
+            "#},
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(mutants, []);
     }
 
     /// Helper function for `find_path_attribute` tests
