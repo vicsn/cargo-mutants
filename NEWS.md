@@ -2,7 +2,11 @@
 
 ## Unreleased
 
+- New: `mod foo;` statements inside item-position macro invocations, such as `cfg_if!` or other macros that wrap items, are now followed, so that files declared through a macro are discovered and mutated. Previously such files were silently skipped. The macro body itself is still not mutated.
+
 - Fixed: Code under a `cfg` predicate that can only hold in test builds, such as `#[cfg(all(test, feature = "x"))]`, is now excluded from mutation like `#[cfg(test)]`. Previously only a bare `test` was recognized.
+
+- Fixed: A source file named by more than one `mod` statement is visited only once.
 
 - New: `#[mutants::exclude_re("pattern")]` attribute to exclude specific mutations by regex, without disabling all mutations on the function. The attribute can be placed on functions, `impl` blocks, `trait` blocks, modules, files, and on expressions that can carry an attribute (such as `match`, struct literals, call expressions, method calls, and unary expressions). Multiple patterns can be applied. Also supported within `cfg_attr`. Requires the [mutants](https://crates.io/crates/mutants) crate version `0.0.5` or later.
 
